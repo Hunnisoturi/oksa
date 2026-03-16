@@ -1,0 +1,118 @@
+# oksa: Lightweight Git-like VCS — High-Level Plan
+
+## Architecture Overview
+
+oksa/
+├── cmd/            # CLI entry points (client commands)
+├── internal/
+│   ├── object/     # Content-addressable object store
+│   ├── repo/       # Repository structure (.oksa/ dir)
+│   ├── index/      # Staging area
+│   ├── refs/       # Branches, tags, HEAD
+│   ├── diff/       # Diffing trees/blobs
+│   └── protocol/   # Client-server protocol
+├── server/         # HTTP server for push/pull
+└── main.go
+
+
+## Phase 1 — Object Model (Foundation)
+
+Everything else builds on this. Git's core insight: content-addressable storage.
+
+Object types to implement:
+  Blob   - Raw file content
+  Tree   - Directory listing (name→hash→type)
+  Commit - Snapshot: tree hash + parent(s) + metadata
+  Tag    - Named pointer to a commit
+
+Key decisions:
+  - Hash function: SHA-256 (vs git's SHA-1 — SHA-256 is more future-proof)
+  - Object format: "<type> <size>\0<content>" (same as git) or a simple binary/msgpack format
+  - Storage: <repo>/.oksa/objects/<2-char-prefix>/<remaining-hash>
+
+Deliverables:
+  - internal/object: Read, Write, Hash functions for each type
+  - Serialization/deserialization for all object types
+
+
+## Phase 2 — Repository & Core Commands
+
+.oksa/ layout:
+  .oksa/
+  ├── objects/          # object store
+  ├── refs/
+  │   ├── heads/        # branches (main, feature-x, …)
+  │   └── tags/
+  ├── HEAD              # "ref: refs/heads/main"
+  ├── index             # staging area (binary or JSON)
+  └── config            # repo config (remote URLs, etc.)
+
+Commands to implement (in order):
+  1. oksa init          - create .oksa/ structure
+  2. oksa add <path>    - hash files → blobs, write to index
+  3. oksa commit -m ... - build tree from index, create commit object, advance HEAD
+  4. oksa log           - walk commit parent chain, display history
+  5. oksa status        - compare working tree / index / HEAD tree
+  6. oksa diff          - show line-level changes (index vs HEAD, or working vs index)
+  7. oksa branch        - create/switch branches via refs
+     oksa checkout
+
+
+## Phase 3 — Merging & History Manipulation
+
+  - oksa merge <branch>  — three-way merge (find common ancestor via DAG traversal)
+  - oksa cherry-pick / oksa revert
+  - Conflict markers in working tree files
+  - .oksa/MERGE_HEAD state tracking
+
+
+## Phase 4 — Server & Networking
+
+Protocol design (HTTP-based, like git's smart HTTP):
+  GET  /info/refs?service=oksa-upload-pack   - for fetch/clone
+  POST /oksa-upload-pack                     - server sends objects client needs
+  POST /oksa-receive-pack                    - client pushes new objects + ref updates
+
+Server component:
+  - server/ package: HTTP handlers for the above endpoints
+  - Authentication: token-based (header "Authorization: Bearer <token>")
+  - Object negotiation: client sends list of "have" hashes, server sends minimal pack
+
+Client commands:
+  - oksa remote add <name> <url>
+  - oksa clone <url> [dir]
+  - oksa fetch [remote]
+  - oksa push [remote] [branch]
+  - oksa pull  (fetch + merge)
+
+Pack format:
+  - Bundle multiple objects for efficient transfer
+  - Simple approach: newline-delimited, length-prefixed, zlib-compressed objects
+
+
+## Recommended Implementation Order
+
+  1. Object model (internal/object)   — blobs + SHA hashing, the atomic unit
+  2. Repo init (internal/repo)        — sets up .oksa/
+  3. Staging + add (internal/index)   — track files
+  4. Commit                           — ties blob → tree → commit objects together
+  5. Log                              — validates commit chain works
+  6. Refs + branch/checkout           — unlock basic branching
+  7. Status/diff                      — makes the tool actually usable
+  8. Server + push/pull               — networking layer on top of solid core
+
+
+## Critical Files
+  internal/object/object.go  — types, serialization, hash
+  internal/repo/repo.go      — init, discover repo root
+  internal/index/index.go    — staged entries
+  internal/refs/refs.go      — read/write HEAD, branches
+  cmd/init.go, cmd/add.go, cmd/commit.go, cmd/log.go, ...
+  server/server.go            — HTTP server (Phase 4)
+
+
+## Verification
+  Phase 1: unit tests for object serialization round-trips
+  Phase 2: oksa init && oksa add . && oksa commit -m "first" → oksa log shows it
+  Phase 3: merge two diverged branches, verify file content
+  Phase 4: oksa clone localhost:8080/repo ./copy → identical object store
